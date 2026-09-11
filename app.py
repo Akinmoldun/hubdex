@@ -73,17 +73,21 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS applications (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    company      TEXT NOT NULL,
-    role         TEXT NOT NULL,
+    company_name TEXT NOT NULL DEFAULT '',
+    job_title    TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL DEFAULT 'Wishlist',
+    application_date TEXT NOT NULL DEFAULT '',
+    notes        TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    company      TEXT NOT NULL DEFAULT '',
+    role         TEXT NOT NULL DEFAULT '',
     location     TEXT NOT NULL DEFAULT '',
     salary       TEXT NOT NULL DEFAULT '',
     url          TEXT NOT NULL DEFAULT '',
     stage        TEXT NOT NULL DEFAULT 'Wishlist',
     priority     TEXT NOT NULL DEFAULT 'Medium',
-    applied_date TEXT NOT NULL DEFAULT '',
-    notes        TEXT NOT NULL DEFAULT '',
-    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+    applied_date TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_applications_user   ON applications(user_id);
@@ -93,17 +97,55 @@ CREATE INDEX IF NOT EXISTS idx_applications_stage  ON applications(user_id, stag
 
 def init_db():
     db = sqlite3.connect(DATABASE)
-    db.executescript(SCHEMA)
-    # Idempotent migration: add email_verified to databases created by
-    # earlier versions of the app (CREATE TABLE IF NOT EXISTS will not).
-    cols = [row[1] for row in db.execute("PRAGMA table_info(users)").fetchall()]
-    if "email_verified" not in cols:
+    try:
+        db.execute("PRAGMA foreign_keys = ON")
+        db.executescript(SCHEMA)
+        user_cols = {row[1] for row in db.execute("PRAGMA table_info(users)")}
+        if "email_verified" not in user_cols:
+            db.execute(
+                "ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0"
+            )
+
+        application_cols = {
+            row[1] for row in db.execute("PRAGMA table_info(applications)")
+        }
+        additions = {
+            "company_name": "TEXT NOT NULL DEFAULT ''",
+            "job_title": "TEXT NOT NULL DEFAULT ''",
+            "status": "TEXT NOT NULL DEFAULT 'Wishlist'",
+            "application_date": "TEXT NOT NULL DEFAULT ''",
+            "notes": "TEXT NOT NULL DEFAULT ''",
+            "created_at": "TEXT NOT NULL DEFAULT (datetime('now'))",
+            "updated_at": "TEXT NOT NULL DEFAULT (datetime('now'))",
+        }
+        for column, definition in additions.items():
+            if column not in application_cols:
+                db.execute(f"ALTER TABLE applications ADD COLUMN {column} {definition}")
+
         db.execute(
-            "ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0"
+            """UPDATE applications
+               SET company_name = CASE WHEN company_name = '' THEN company ELSE company_name END,
+                   job_title = CASE WHEN job_title = '' THEN role ELSE job_title END,
+                   status = CASE WHEN status = 'Wishlist' AND stage <> 'Wishlist'
+                                 THEN stage ELSE status END,
+                   application_date = CASE WHEN application_date = ''
+                                           THEN applied_date ELSE application_date END"""
+        )
+        db.execute(
+            """UPDATE applications
+               SET company = CASE WHEN company = '' THEN company_name ELSE company END,
+                   role = CASE WHEN role = '' THEN job_title ELSE role END,
+                   stage = CASE WHEN stage = 'Wishlist' AND status <> 'Wishlist'
+                                THEN status ELSE stage END,
+                   applied_date = CASE WHEN applied_date = ''
+                                       THEN application_date ELSE applied_date END"""
         )
         db.commit()
-    db.commit()
-    db.close()
+    except sqlite3.Error:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -145,8 +187,14 @@ LIMITS = {
 
 def clean_application(form):
     data = {}
+    aliases = {
+        "company": "company_name",
+        "role": "job_title",
+        "applied_date": "application_date",
+    }
     for field, limit in LIMITS.items():
-        value = (form.get(field) or "").strip()
+        source = aliases.get(field, field)
+        value = (form.get(source) or form.get(field) or "").strip()
         if len(value) > limit:
             raise ValueError(f"{field.title()} is limited to {limit} characters.")
         data[field] = value
@@ -165,7 +213,7 @@ def clean_application(form):
         except ValueError:
             raise ValueError("Invalid applied date.")
 
-    data["stage"] = form.get("stage") or "Wishlist"
+    data["stage"] = form.get("status") or form.get("stage") or "Wishlist"
     if data["stage"] not in STAGES:
         raise ValueError("Invalid stage.")
     data["priority"] = form.get("priority") or "Medium"
@@ -265,6 +313,7 @@ def register():
                     db.commit()
                 except sqlite3.IntegrityError:
                     # Race fallback: another request created the same email.
+                    db.rollback()
                     flash(
                         "An account with this email already exists. "
                         "Please sign in instead.",
@@ -372,16 +421,26 @@ def application_new():
             flash(str(exc), "error")
         else:
             db = get_db()
-            db.execute(
-                """INSERT INTO applications
-                   (user_id, company, role, location, salary, url,
-                    stage, priority, applied_date, notes)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (user["id"], data["company"], data["role"], data["location"],
-                 data["salary"], data["url"], data["stage"],
-                 data["priority"], data["applied_date"], data["notes"]),
-            )
-            db.commit()
+            try:
+                db.execute(
+                    """INSERT INTO applications
+                       (user_id, company_name, job_title, status,
+                        application_date, notes, company, role, location,
+                        salary, url, stage, priority, applied_date)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (user["id"], data["company"], data["role"], data["stage"],
+                     data["applied_date"], data["notes"], data["company"],
+                     data["role"], data["location"], data["salary"], data["url"],
+                     data["stage"], data["priority"], data["applied_date"]),
+                )
+                db.commit()
+            except sqlite3.Error:
+                db.rollback()
+                flash("Could not save the application. Please try again.", "error")
+                return render_template(
+                    "application_form.html", user=user, app_row=None,
+                    stages=STAGES, priorities=PRIORITIES,
+                )
             flash("Application added to your hub.", "success")
             return redirect(url_for("dashboard"))
     return render_template(
@@ -407,18 +466,29 @@ def application_edit(app_id):
         except ValueError as exc:
             flash(str(exc), "error")
         else:
-            db.execute(
-                """UPDATE applications
-                   SET company = ?, role = ?, location = ?, salary = ?,
-                       url = ?, stage = ?, priority = ?, applied_date = ?,
-                       notes = ?, updated_at = datetime('now')
-                   WHERE id = ? AND user_id = ?""",
-                (data["company"], data["role"], data["location"],
-                 data["salary"], data["url"], data["stage"],
-                 data["priority"], data["applied_date"], data["notes"],
-                 app_id, user["id"]),
-            )
-            db.commit()
+            try:
+                db.execute(
+                    """UPDATE applications
+                       SET company_name = ?, job_title = ?, status = ?,
+                           application_date = ?, notes = ?, company = ?,
+                           role = ?, location = ?, salary = ?, url = ?,
+                           stage = ?, priority = ?, applied_date = ?,
+                           updated_at = datetime('now')
+                       WHERE id = ? AND user_id = ?""",
+                    (data["company"], data["role"], data["stage"],
+                     data["applied_date"], data["notes"], data["company"],
+                     data["role"], data["location"], data["salary"], data["url"],
+                     data["stage"], data["priority"], data["applied_date"],
+                     app_id, user["id"]),
+                )
+                db.commit()
+            except sqlite3.Error:
+                db.rollback()
+                flash("Could not update the application. Please try again.", "error")
+                return render_template(
+                    "application_form.html", user=user, app_row=row,
+                    stages=STAGES, priorities=PRIORITIES,
+                )
             flash("Application updated.", "success")
             return redirect(url_for("dashboard"))
     return render_template(
@@ -435,13 +505,17 @@ def application_stage(app_id):
     if stage not in STAGES:
         abort(400)
     db = get_db()
-    cur = db.execute(
-        """UPDATE applications
-           SET stage = ?, updated_at = datetime('now')
-           WHERE id = ? AND user_id = ?""",
-        (stage, app_id, user["id"]),
-    )
-    db.commit()
+    try:
+        cur = db.execute(
+            """UPDATE applications
+               SET status = ?, stage = ?, updated_at = datetime('now')
+               WHERE id = ? AND user_id = ?""",
+            (stage, stage, app_id, user["id"]),
+        )
+        db.commit()
+    except sqlite3.Error:
+        db.rollback()
+        raise
     if cur.rowcount == 0:
         abort(404)
     return redirect(request.referrer or url_for("dashboard"))
@@ -452,11 +526,15 @@ def application_stage(app_id):
 def application_delete(app_id):
     user = current_user()
     db = get_db()
-    cur = db.execute(
-        "DELETE FROM applications WHERE id = ? AND user_id = ?",
-        (app_id, user["id"]),
-    )
-    db.commit()
+    try:
+        cur = db.execute(
+            "DELETE FROM applications WHERE id = ? AND user_id = ?",
+            (app_id, user["id"]),
+        )
+        db.commit()
+    except sqlite3.Error:
+        db.rollback()
+        raise
     if cur.rowcount == 0:
         abort(404)
     flash("Application removed.", "success")

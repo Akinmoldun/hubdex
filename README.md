@@ -35,6 +35,18 @@ python app.py
 Open http://127.0.0.1:5000
 
 The SQLite database (`hubdex.db`) is created automatically on first run.
+On startup, `init_db()` applies idempotent migrations to the existing database:
+it creates the `applications` table when needed and adds/backfills the canonical
+application fields without deleting existing users or applications. No separate
+database file is created.
+
+### Database schema
+
+`users` stores account credentials and profile data. `applications` stores each
+job application with `user_id` as a foreign key to `users.id`. Dashboard,
+create, edit, stage, and delete queries always scope applications to the
+authenticated user's ID. Existing legacy application columns are retained and
+kept synchronized during migration for compatibility with older databases.
 
 ## Project layout
 
